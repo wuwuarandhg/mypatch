@@ -177,10 +177,11 @@ export const tradingAgentsApi = {
   },
 
   /** 查某只股票最近 30 分钟有没有在跑或刚完成的 TA 任务(后端权威源)。
-   *  返回 status: running | success | failed | none */
+   *  返回 status: running | success | failed | stale | none
+   *  stale = 5 分钟无新进度日志,前端可据此 reset 到 idle 允许重新触发 */
   findRunning(symbol: string): Promise<{
     trace_id: string | null
-    status: 'running' | 'success' | 'failed' | 'none'
+    status: 'running' | 'success' | 'failed' | 'stale' | 'none'
     last_activity_at?: string
   }> {
     return fetchAPI(`/agents/tradingagents/running?stock_symbol=${encodeURIComponent(symbol)}`)
