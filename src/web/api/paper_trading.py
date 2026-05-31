@@ -1,7 +1,7 @@
 """模拟盘 API 端点。"""
 
 import logging
-from datetime import timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -9,7 +9,13 @@ from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
 from src.config import Settings
-from src.core.paper_trading_engine import ENGINE
+from src.core.paper_trading_engine import (
+    ALL_MARKETS,
+    ENGINE,
+    compute_market_cash,
+    market_allocations_or_default,
+    normalize_allocations,
+)
 from src.web.database import get_db
 from src.web.models import (
     AppSettings,
@@ -41,35 +47,247 @@ class ToggleBody(BaseModel):
 
 
 class UpdateSettingsBody(BaseModel):
-    excluded_markets: list[str] | None = None
+    excluded_markets: list[str] | None = None  # 兼容旧字段
+    market_allocations: dict[str, float] | None = None  # {"CN":0.5,...}，合计 ≤ 1
+    initial_capital: float | None = None  # 总资金（>0 时按差额增/减资）
 
 
-def _account_response(acc: PaperTradingAccount, open_positions: list[PaperTradingPosition] | None = None) -> dict:
-    unrealized = 0.0
-    positions_value = 0.0
-    if open_positions:
-        for p in open_positions:
-            unrealized += p.unrealized_pnl or 0
-            positions_value += (p.current_price or p.entry_price) * p.quantity
-    total_equity = acc.current_capital + positions_value
-    win_rate = (acc.winning_trades / acc.total_trades * 100) if acc.total_trades > 0 else 0.0
-    return {
+def _serialize_account_dict(
+    acc: PaperTradingAccount,
+    *,
+    initial: float,
+    cash: float,
+    total_equity: float,
+    total_pnl: float,
+    unrealized: float,
+    total_trades: int,
+    winning_trades: int,
+    max_dd: float,
+    peak: float,
+    market: str | None = None,
+    ratio: float | None = None,
+) -> dict:
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0.0
+    out = {
         "id": acc.id,
-        "initial_capital": acc.initial_capital,
-        "current_capital": acc.current_capital,
+        "initial_capital": round(initial, 2),
+        "current_capital": round(cash, 2),
         "total_equity": round(total_equity, 2),
-        "total_pnl": round(acc.total_pnl, 2),
+        "total_pnl": round(total_pnl, 2),
         "unrealized_pnl": round(unrealized, 2),
-        "total_trades": acc.total_trades,
-        "winning_trades": acc.winning_trades,
+        "total_trades": total_trades,
+        "winning_trades": winning_trades,
         "win_rate": round(win_rate, 2),
-        "max_drawdown_pct": acc.max_drawdown_pct,
-        "peak_capital": acc.peak_capital,
+        "max_drawdown_pct": round(max_dd, 2),
+        "peak_capital": round(peak, 2),
         "enabled": acc.enabled,
         "excluded_markets": acc.excluded_markets or [],
+        "market_allocations": market_allocations_or_default(acc),
         "created_at": _format_dt(acc.created_at),
         "updated_at": _format_dt(acc.updated_at),
     }
+    if market:
+        out["market"] = market
+        out["allocation_ratio"] = round(ratio or 0.0, 6)
+    return out
+
+
+def _build_equity_curve(
+    db: Session, acc: PaperTradingAccount, market: str | None
+) -> tuple[list[dict], float, float]:
+    """构建收益曲线，返回 (curve, peak, max_drawdown_pct)。market=None 为全市场。"""
+    ratio = market_allocations_or_default(acc).get(market, 0.0) if market else 1.0
+    base = acc.initial_capital * ratio if market else acc.initial_capital
+
+    tq = db.query(PaperTradingTrade).order_by(PaperTradingTrade.closed_at.asc())
+    if market:
+        tq = tq.filter(PaperTradingTrade.stock_market == market)
+    trades = tq.all()
+
+    pq = db.query(PaperTradingPosition).filter(PaperTradingPosition.status == "open")
+    if market:
+        pq = pq.filter(PaperTradingPosition.stock_market == market)
+    open_positions = pq.all()
+
+    by_date: dict[str, float] = {}
+    for t in trades:
+        if not t.closed_at:
+            continue
+        dt = t.closed_at
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        date_str = dt.strftime("%Y-%m-%d")
+        by_date.setdefault(date_str, 0.0)
+        by_date[date_str] += t.pnl
+
+    curve: list[dict] = []
+    running = base
+    for date_str in sorted(by_date.keys()):
+        running += by_date[date_str]
+        curve.append({"date": date_str, "equity": round(running, 2)})
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    positions_value = sum(
+        (p.current_price or p.entry_price) * p.quantity for p in open_positions
+    )
+    if market:
+        realized = sum(t.pnl for t in trades)
+        open_cost = sum(p.entry_price * p.quantity for p in open_positions)
+        cash_now = compute_market_cash(acc.initial_capital, ratio, realized, open_cost)
+    else:
+        cash_now = acc.current_capital
+    total_equity_now = cash_now + positions_value
+    if curve and curve[-1]["date"] == today_str:
+        curve[-1]["equity"] = round(total_equity_now, 2)
+    else:
+        curve.append({"date": today_str, "equity": round(total_equity_now, 2)})
+
+    if len(curve) == 1:
+        created = acc.created_at
+        if created:
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            start_str = created.strftime("%Y-%m-%d")
+            if start_str != today_str:
+                curve.insert(0, {"date": start_str, "equity": round(base, 2)})
+            else:
+                curve.insert(0, {"date": today_str + " 00:00", "equity": round(base, 2)})
+
+    peak = base
+    max_dd = 0.0
+    for pt in curve:
+        eq = pt["equity"]
+        if eq > peak:
+            peak = eq
+        if peak > 0:
+            dd = (peak - eq) / peak * 100
+            if dd > max_dd:
+                max_dd = dd
+    return curve, peak, max_dd
+
+
+def _account_summary(db: Session, acc: PaperTradingAccount, market: str | None) -> dict:
+    """账户汇总。market=None 为全账户（沿用引擎维护的回撤）；否则按该市场子池口径。"""
+    if not market or market not in ALL_MARKETS:
+        open_positions = (
+            db.query(PaperTradingPosition)
+            .filter(PaperTradingPosition.status == "open")
+            .all()
+        )
+        unrealized = sum(p.unrealized_pnl or 0 for p in open_positions)
+        positions_value = sum(
+            (p.current_price or p.entry_price) * p.quantity for p in open_positions
+        )
+        return _serialize_account_dict(
+            acc,
+            initial=acc.initial_capital,
+            cash=acc.current_capital,
+            total_equity=acc.current_capital + positions_value,
+            total_pnl=acc.total_pnl,
+            unrealized=unrealized,
+            total_trades=acc.total_trades,
+            winning_trades=acc.winning_trades,
+            max_dd=acc.max_drawdown_pct,
+            peak=acc.peak_capital,
+        )
+
+    alloc = market_allocations_or_default(acc)
+    ratio = alloc.get(market, 0.0)
+    open_positions = (
+        db.query(PaperTradingPosition)
+        .filter(
+            PaperTradingPosition.status == "open",
+            PaperTradingPosition.stock_market == market,
+        )
+        .all()
+    )
+    trades = (
+        db.query(PaperTradingTrade)
+        .filter(PaperTradingTrade.stock_market == market)
+        .all()
+    )
+    realized = sum(t.pnl for t in trades)
+    open_cost = sum(p.entry_price * p.quantity for p in open_positions)
+    cash = compute_market_cash(acc.initial_capital, ratio, realized, open_cost)
+    positions_value = sum(
+        (p.current_price or p.entry_price) * p.quantity for p in open_positions
+    )
+    winning = sum(1 for t in trades if t.pnl > 0)
+    _, peak, max_dd = _build_equity_curve(db, acc, market)
+    unrealized = sum(p.unrealized_pnl or 0 for p in open_positions)
+    return _serialize_account_dict(
+        acc,
+        initial=acc.initial_capital * ratio,
+        cash=cash,
+        total_equity=cash + positions_value,
+        total_pnl=realized,
+        unrealized=unrealized,
+        total_trades=len(trades),
+        winning_trades=winning,
+        max_dd=max_dd,
+        peak=peak,
+        market=market,
+        ratio=ratio,
+    )
+
+
+def _strategy_performance(db: Session, market: str | None) -> list[dict]:
+    """按策略聚合绩效（已平仓 + 持仓中），可按市场过滤。"""
+    tq = db.query(PaperTradingTrade)
+    if market:
+        tq = tq.filter(PaperTradingTrade.stock_market == market)
+    all_trades = tq.all()
+
+    pq = db.query(PaperTradingPosition).filter(PaperTradingPosition.status == "open")
+    if market:
+        pq = pq.filter(PaperTradingPosition.stock_market == market)
+    open_positions = pq.all()
+
+    strategy_stats: dict[str, dict] = {}
+    for t in all_trades:
+        code = t.strategy_code or "unknown"
+        s = strategy_stats.setdefault(code, {
+            "strategy_code": code,
+            "total_trades": 0, "winning_trades": 0,
+            "total_pnl": 0.0, "total_pnl_pct_sum": 0.0,
+            "holding_days_sum": 0,
+            "open_positions": 0, "unrealized_pnl": 0.0,
+        })
+        s["total_trades"] += 1
+        s["total_pnl"] += t.pnl
+        s["total_pnl_pct_sum"] += t.pnl_pct
+        s["holding_days_sum"] += t.holding_days or 0
+        if t.pnl > 0:
+            s["winning_trades"] += 1
+
+    for p in open_positions:
+        code = p.strategy_code or "unknown"
+        s = strategy_stats.setdefault(code, {
+            "strategy_code": code,
+            "total_trades": 0, "winning_trades": 0,
+            "total_pnl": 0.0, "total_pnl_pct_sum": 0.0,
+            "holding_days_sum": 0,
+            "open_positions": 0, "unrealized_pnl": 0.0,
+        })
+        s["open_positions"] += 1
+        s["unrealized_pnl"] += p.unrealized_pnl or 0
+
+    strategy_perf = []
+    for s in strategy_stats.values():
+        n = s["total_trades"]
+        strategy_perf.append({
+            "strategy_code": s["strategy_code"],
+            "total_trades": n,
+            "winning_trades": s["winning_trades"],
+            "win_rate": round(s["winning_trades"] / n * 100, 1) if n > 0 else 0,
+            "total_pnl": round(s["total_pnl"], 2),
+            "avg_pnl_pct": round(s["total_pnl_pct_sum"] / n, 2) if n > 0 else 0,
+            "avg_holding_days": round(s["holding_days_sum"] / n, 1) if n > 0 else 0,
+            "open_positions": s["open_positions"],
+            "unrealized_pnl": round(s["unrealized_pnl"], 2),
+        })
+    strategy_perf.sort(key=lambda x: x["total_pnl"] + x["unrealized_pnl"], reverse=True)
+    return strategy_perf
 
 
 def _position_response(p: PaperTradingPosition) -> dict:
@@ -130,7 +348,7 @@ def _trade_response(t: PaperTradingTrade) -> dict:
 
 
 @router.get("/account")
-def get_account(db: Session = Depends(get_db)):
+def get_account(market: str | None = None, db: Session = Depends(get_db)):
     acc = db.query(PaperTradingAccount).first()
     if not acc:
         acc = PaperTradingAccount(
@@ -141,29 +359,28 @@ def get_account(db: Session = Depends(get_db)):
         db.add(acc)
         db.commit()
         db.refresh(acc)
-    open_positions = (
-        db.query(PaperTradingPosition)
-        .filter(PaperTradingPosition.status == "open")
-        .all()
-    )
-    return _account_response(acc, open_positions)
+    return _account_summary(db, acc, market if market in ALL_MARKETS else None)
 
 
 @router.get("/positions")
-def list_positions(status: str = "open", db: Session = Depends(get_db)):
+def list_positions(status: str = "open", market: str | None = None, db: Session = Depends(get_db)):
     query = db.query(PaperTradingPosition)
     if status != "all":
         query = query.filter(PaperTradingPosition.status == status)
+    if market in ALL_MARKETS:
+        query = query.filter(PaperTradingPosition.stock_market == market)
     rows = query.order_by(PaperTradingPosition.opened_at.desc()).all()
     return [_position_response(p) for p in rows]
 
 
 @router.get("/trades")
-def list_trades(limit: int = 50, offset: int = 0, db: Session = Depends(get_db)):
-    total = db.query(PaperTradingTrade).count()
+def list_trades(limit: int = 50, offset: int = 0, market: str | None = None, db: Session = Depends(get_db)):
+    base = db.query(PaperTradingTrade)
+    if market in ALL_MARKETS:
+        base = base.filter(PaperTradingTrade.stock_market == market)
+    total = base.count()
     rows = (
-        db.query(PaperTradingTrade)
-        .order_by(PaperTradingTrade.closed_at.desc())
+        base.order_by(PaperTradingTrade.closed_at.desc())
         .offset(max(0, offset))
         .limit(max(1, min(limit, 200)))
         .all()
@@ -175,122 +392,25 @@ def list_trades(limit: int = 50, offset: int = 0, db: Session = Depends(get_db))
 
 
 @router.get("/metrics")
-def get_metrics(db: Session = Depends(get_db)):
+def get_metrics(market: str | None = None, db: Session = Depends(get_db)):
     acc = db.query(PaperTradingAccount).first()
     if not acc:
-        return {"account": None, "equity_curve": [], "open_positions": 0}
+        return {"account": None, "equity_curve": [], "open_positions": 0, "strategy_performance": []}
 
-    open_positions = (
-        db.query(PaperTradingPosition)
-        .filter(PaperTradingPosition.status == "open")
-        .all()
-    )
-    open_count = len(open_positions)
+    mkt = market if market in ALL_MARKETS else None
 
-    # 构建收益曲线：已平仓盈亏按日聚合 + 当天浮动权益
-    trades = (
-        db.query(PaperTradingTrade)
-        .order_by(PaperTradingTrade.closed_at.asc())
-        .all()
-    )
-    equity_curve = []
-    by_date: dict[str, float] = {}
-    for t in trades:
-        date_str = ""
-        if t.closed_at:
-            dt = t.closed_at
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            date_str = dt.strftime("%Y-%m-%d")
-        if not date_str:
-            continue
-        by_date.setdefault(date_str, 0)
-        by_date[date_str] += t.pnl
+    pq = db.query(PaperTradingPosition).filter(PaperTradingPosition.status == "open")
+    if mkt:
+        pq = pq.filter(PaperTradingPosition.stock_market == mkt)
+    open_count = pq.count()
 
-    running = acc.initial_capital
-    for date_str in sorted(by_date.keys()):
-        running += by_date[date_str]
-        equity_curve.append({"date": date_str, "equity": round(running, 2)})
-
-    # 追加当前时刻的总权益（含未平仓浮动盈亏）
-    from datetime import datetime as dt_cls
-    today_str = dt_cls.now(timezone.utc).strftime("%Y-%m-%d")
-    positions_value = sum(
-        (p.current_price or p.entry_price) * p.quantity for p in open_positions
-    )
-    total_equity_now = acc.current_capital + positions_value
-    if equity_curve and equity_curve[-1]["date"] == today_str:
-        # 同一天：用含浮动的总权益覆盖
-        equity_curve[-1]["equity"] = round(total_equity_now, 2)
-    else:
-        equity_curve.append({"date": today_str, "equity": round(total_equity_now, 2)})
-
-    # 如果只有一个点（今天），补一个起始点
-    if len(equity_curve) == 1:
-        # 用账户创建日作为起始点
-        created = acc.created_at
-        if created:
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-            start_str = created.strftime("%Y-%m-%d")
-            if start_str != today_str:
-                equity_curve.insert(0, {"date": start_str, "equity": acc.initial_capital})
-            else:
-                # 同一天创建，人为加一个初始点
-                equity_curve.insert(0, {"date": today_str + " 00:00", "equity": acc.initial_capital})
-
-    # 按策略聚合绩效（已平仓 + 持仓中）
-    all_trades = db.query(PaperTradingTrade).all()
-    strategy_stats: dict[str, dict] = {}
-    for t in all_trades:
-        code = t.strategy_code or "unknown"
-        s = strategy_stats.setdefault(code, {
-            "strategy_code": code,
-            "total_trades": 0, "winning_trades": 0,
-            "total_pnl": 0.0, "total_pnl_pct_sum": 0.0,
-            "holding_days_sum": 0,
-            "open_positions": 0, "unrealized_pnl": 0.0,
-        })
-        s["total_trades"] += 1
-        s["total_pnl"] += t.pnl
-        s["total_pnl_pct_sum"] += t.pnl_pct
-        s["holding_days_sum"] += t.holding_days or 0
-        if t.pnl > 0:
-            s["winning_trades"] += 1
-
-    for p in open_positions:
-        code = p.strategy_code or "unknown"
-        s = strategy_stats.setdefault(code, {
-            "strategy_code": code,
-            "total_trades": 0, "winning_trades": 0,
-            "total_pnl": 0.0, "total_pnl_pct_sum": 0.0,
-            "holding_days_sum": 0,
-            "open_positions": 0, "unrealized_pnl": 0.0,
-        })
-        s["open_positions"] += 1
-        s["unrealized_pnl"] += p.unrealized_pnl or 0
-
-    strategy_perf = []
-    for s in strategy_stats.values():
-        n = s["total_trades"]
-        strategy_perf.append({
-            "strategy_code": s["strategy_code"],
-            "total_trades": n,
-            "winning_trades": s["winning_trades"],
-            "win_rate": round(s["winning_trades"] / n * 100, 1) if n > 0 else 0,
-            "total_pnl": round(s["total_pnl"], 2),
-            "avg_pnl_pct": round(s["total_pnl_pct_sum"] / n, 2) if n > 0 else 0,
-            "avg_holding_days": round(s["holding_days_sum"] / n, 1) if n > 0 else 0,
-            "open_positions": s["open_positions"],
-            "unrealized_pnl": round(s["unrealized_pnl"], 2),
-        })
-    strategy_perf.sort(key=lambda x: x["total_pnl"] + x["unrealized_pnl"], reverse=True)
+    equity_curve, _peak, _max_dd = _build_equity_curve(db, acc, mkt)
 
     return {
-        "account": _account_response(acc, open_positions),
+        "account": _account_summary(db, acc, mkt),
         "equity_curve": equity_curve,
         "open_positions": open_count,
-        "strategy_performance": strategy_perf,
+        "strategy_performance": _strategy_performance(db, mkt),
     }
 
 
@@ -302,7 +422,7 @@ def toggle_account(body: ToggleBody, db: Session = Depends(get_db)):
     acc.enabled = body.enabled
     db.commit()
     db.refresh(acc)
-    return _account_response(acc)
+    return _account_summary(db, acc, None)
 
 
 @router.post("/account/reset")
@@ -326,12 +446,29 @@ def update_settings(body: UpdateSettingsBody, db: Session = Depends(get_db)):
     acc = db.query(PaperTradingAccount).first()
     if not acc:
         raise HTTPException(404, "模拟盘账户不存在")
-    if body.excluded_markets is not None:
+
+    if body.market_allocations is not None:
+        alloc = normalize_allocations(body.market_allocations)
+        total = sum(alloc.values())
+        if total > 1.0 + 1e-9:
+            raise HTTPException(400, f"投资比例合计不能超过 100%（当前 {round(total * 100)}%）")
+        acc.market_allocations = alloc
+        # 同步派生 excluded_markets（比例 0 即排除），兼容旧读取
+        acc.excluded_markets = [m for m in ALL_MARKETS if alloc.get(m, 0.0) <= 0]
+    elif body.excluded_markets is not None:
         valid = {"CN", "HK", "US"}
         acc.excluded_markets = [m for m in body.excluded_markets if m in valid]
+
+    if body.initial_capital is not None and body.initial_capital > 0:
+        delta = body.initial_capital - (acc.initial_capital or 0.0)
+        acc.initial_capital = body.initial_capital
+        acc.current_capital = (acc.current_capital or 0.0) + delta
+        if acc.peak_capital is None or acc.current_capital > acc.peak_capital:
+            acc.peak_capital = acc.current_capital
+
     db.commit()
     db.refresh(acc)
-    return _account_response(acc)
+    return _account_summary(db, acc, None)
 
 
 @router.post("/scan")

@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
-import { RefreshCw, Power, RotateCcw, X, TrendingUp, TrendingDown, Trophy, BarChart3, Wallet, Activity, Play, Bell } from 'lucide-react'
+import { RefreshCw, Power, RotateCcw, X, TrendingUp, TrendingDown, Trophy, BarChart3, Wallet, Activity, Play, Bell, SlidersHorizontal } from 'lucide-react'
 import {
   paperTradingApi,
   type PaperTradingAccountResponse,
@@ -8,6 +8,7 @@ import {
   type EquityCurvePoint,
   type StrategyPerformanceItem,
   type NotifyChannelItem,
+  type MarketView,
 } from '@panwatch/api'
 import { Button } from '@panwatch/base-ui/components/ui/button'
 import { Switch } from '@panwatch/base-ui/components/ui/switch'
@@ -115,6 +116,15 @@ export default function PaperTradingPage() {
   const [tradesPage, setTradesPage] = useState(0)
   const tradesPageSize = 20
 
+  // 市场视图（分段单选，切换即按该市场口径刷新统计）
+  const [marketView, setMarketView] = useState<MarketView>('ALL')
+
+  // 资金配置
+  const [configOpen, setConfigOpen] = useState(false)
+  const [cfgTotal, setCfgTotal] = useState('')
+  const [cfgRatios, setCfgRatios] = useState<{ CN: string; HK: string; US: string }>({ CN: '', HK: '', US: '' })
+  const [cfgSaving, setCfgSaving] = useState(false)
+
   // 通知设置
   const [tradesOpen, setTradesOpen] = useState(false)
   const [notifyOpen, setNotifyOpen] = useState(false)
@@ -130,11 +140,12 @@ export default function PaperTradingPage() {
   const loadData = useCallback(async () => {
     setLoading(true)
     try {
+      const mkt = marketView === 'ALL' ? undefined : marketView
       const [acc, pos, tradeData, metrics] = await Promise.all([
-        paperTradingApi.getAccount(),
-        paperTradingApi.listPositions('open'),
-        paperTradingApi.listTrades(tradesPageSize, tradesPage * tradesPageSize),
-        paperTradingApi.getMetrics(),
+        paperTradingApi.getAccount(mkt),
+        paperTradingApi.listPositions('open', mkt),
+        paperTradingApi.listTrades(tradesPageSize, tradesPage * tradesPageSize, mkt),
+        paperTradingApi.getMetrics(mkt),
       ])
       setAccount(acc)
       setPositions(pos)
@@ -147,7 +158,7 @@ export default function PaperTradingPage() {
     } finally {
       setLoading(false)
     }
-  }, [tradesPage])
+  }, [tradesPage, marketView])
 
   useEffect(() => { loadData() }, [loadData])
 
@@ -193,6 +204,52 @@ export default function PaperTradingPage() {
       loadData()
     } catch {
       toast('平仓失败', 'error')
+    }
+  }
+
+  const handleOpenConfig = async () => {
+    setConfigOpen(true)
+    try {
+      // 以"全部"口径取总资金与各市场比例
+      const acc = await paperTradingApi.getAccount()
+      setCfgTotal(String(Math.round(acc.initial_capital)))
+      const a = acc.market_allocations || {}
+      setCfgRatios({
+        CN: String(Math.round((a.CN ?? 0) * 100)),
+        HK: String(Math.round((a.HK ?? 0) * 100)),
+        US: String(Math.round((a.US ?? 0) * 100)),
+      })
+    } catch {
+      toast('加载配置失败', 'error')
+    }
+  }
+
+  const handleSaveConfig = async () => {
+    const total = Number(cfgTotal)
+    const cn = Number(cfgRatios.CN) || 0
+    const hk = Number(cfgRatios.HK) || 0
+    const us = Number(cfgRatios.US) || 0
+    if (!(total > 0)) {
+      toast('总资金需大于 0', 'error')
+      return
+    }
+    if (cn + hk + us > 100) {
+      toast('比例合计不能超过 100%', 'error')
+      return
+    }
+    setCfgSaving(true)
+    try {
+      await paperTradingApi.updateSettings({
+        initial_capital: total,
+        market_allocations: { CN: cn / 100, HK: hk / 100, US: us / 100 },
+      })
+      toast('资金配置已保存', 'success')
+      setConfigOpen(false)
+      loadData()
+    } catch {
+      toast('保存失败', 'error')
+    } finally {
+      setCfgSaving(false)
     }
   }
 
@@ -260,6 +317,7 @@ export default function PaperTradingPage() {
   }
 
   const totalPages = Math.ceil(tradesTotal / tradesPageSize)
+  const ratioSum = (Number(cfgRatios.CN) || 0) + (Number(cfgRatios.HK) || 0) + (Number(cfgRatios.US) || 0)
 
   return (
     <div className="space-y-5">
@@ -308,37 +366,37 @@ export default function PaperTradingPage() {
         </div>
       </div>
 
-      {/* Market Filter */}
+      {/* Market View Filter + 资金配置 */}
       {account && (
-        <div className="flex items-center gap-2 text-sm">
-          <span className="text-muted-foreground text-xs">交易市场:</span>
-          {(['CN', 'HK', 'US'] as const).map(market => {
-            const excluded = account.excluded_markets || []
-            const isEnabled = !excluded.includes(market)
-            const label = market === 'CN' ? 'A股' : market === 'HK' ? '港股' : '美股'
-            return (
-              <button
-                key={market}
-                onClick={async () => {
-                  const current = account.excluded_markets || []
-                  const next = isEnabled
-                    ? [...current, market]
-                    : current.filter((m: string) => m !== market)
-                  try {
-                    const res = await paperTradingApi.updateSettings({ excluded_markets: next })
-                    setAccount(res)
-                  } catch { /* ignore */ }
-                }}
-                className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all ${
-                  isEnabled
-                    ? 'bg-primary/10 text-primary ring-1 ring-primary/20'
-                    : 'bg-muted/50 text-muted-foreground line-through'
-                }`}
-              >
-                {label}
-              </button>
-            )
-          })}
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-sm">
+            <span className="text-muted-foreground text-xs">交易市场:</span>
+            {(['ALL', 'CN', 'HK', 'US'] as const).map(m => {
+              const label = m === 'ALL' ? '全部' : m === 'CN' ? 'A股' : m === 'HK' ? '港股' : '美股'
+              const active = marketView === m
+              const ratio = m !== 'ALL' ? account.market_allocations?.[m] : undefined
+              const isOff = m !== 'ALL' && (ratio ?? 0) <= 0
+              return (
+                <button
+                  key={m}
+                  onClick={() => setMarketView(m)}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all ${
+                    active
+                      ? 'bg-primary text-primary-foreground'
+                      : isOff
+                      ? 'bg-muted/50 text-muted-foreground'
+                      : 'bg-primary/10 text-primary ring-1 ring-primary/20'
+                  }`}
+                >
+                  {label}{m !== 'ALL' && ratio != null ? ` ${Math.round(ratio * 100)}%` : ''}
+                </button>
+              )
+            })}
+          </div>
+          <Button variant="outline" size="sm" className="h-8" onClick={handleOpenConfig}>
+            <SlidersHorizontal className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline ml-1">资金配置</span>
+          </Button>
         </div>
       )}
 
@@ -563,6 +621,65 @@ export default function PaperTradingPage() {
               )}
             </>
           )}
+        </DialogContent>
+      </Dialog>
+
+      {/* 资金配置对话框 */}
+      <Dialog open={configOpen} onOpenChange={setConfigOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>资金配置</DialogTitle>
+            <DialogDescription>设置总资金与各市场投资比例，比例为 0 则不投入该市场（已有持仓不受影响，仅停止新建仓）</DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div>
+              <div className="text-sm font-medium mb-1">总资金</div>
+              <input
+                type="number"
+                value={cfgTotal}
+                onChange={e => setCfgTotal(e.target.value)}
+                className="w-full h-9 px-3 rounded-lg border border-border bg-background text-sm"
+                placeholder="如 1000000"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-sm font-medium">
+                <span>各市场投资比例</span>
+                <span className={`text-xs ${ratioSum > 100 ? 'text-destructive' : 'text-muted-foreground'}`}>
+                  合计 {ratioSum}%{ratioSum > 100 ? '（超过 100%）' : ''}
+                </span>
+              </div>
+              {(['CN', 'HK', 'US'] as const).map(m => {
+                const label = m === 'CN' ? 'A股' : m === 'HK' ? '港股' : '美股'
+                const pct = Number(cfgRatios[m]) || 0
+                const amount = ((Number(cfgTotal) || 0) * pct) / 100
+                return (
+                  <div key={m} className="flex items-center gap-3">
+                    <span className="w-12 text-sm">{label}</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      value={cfgRatios[m]}
+                      onChange={e => setCfgRatios(prev => ({ ...prev, [m]: e.target.value }))}
+                      className="w-20 h-9 px-2 rounded-lg border border-border bg-background text-sm text-right"
+                    />
+                    <span className="text-sm text-muted-foreground">%</span>
+                    <span className="text-xs text-muted-foreground ml-auto">≈ {formatCurrency(amount)}</span>
+                  </div>
+                )
+              })}
+              <div className="text-xs text-muted-foreground">合计可小于 100%，余下为闲置不投入的资金。</div>
+            </div>
+
+            <div className="flex items-center gap-2 pt-1">
+              <Button size="sm" onClick={handleSaveConfig} disabled={cfgSaving || ratioSum > 100}>
+                {cfgSaving ? '保存中...' : '保存'}
+              </Button>
+            </div>
+          </div>
         </DialogContent>
       </Dialog>
 

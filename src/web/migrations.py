@@ -1533,6 +1533,58 @@ def _m117_chat_initial_context(conn: Connection) -> None:
         pass  # column already exists
 
 
+def _m118_paper_trading_market_allocations(conn: Connection) -> None:
+    """模拟盘账户新增 market_allocations（各市场投资比例），并由 excluded_markets 回填。"""
+    _add_column_if_missing(
+        conn,
+        "paper_trading_account",
+        "market_allocations",
+        "ALTER TABLE paper_trading_account ADD COLUMN market_allocations TEXT DEFAULT '{}'",
+    )
+    if not _has_table(conn, "paper_trading_account"):
+        return
+
+    # 复用引擎的纯函数推导比例（函数内导入，避免模块级循环依赖）
+    from src.core.paper_trading_engine import allocations_from_excluded
+
+    rows = conn.execute(
+        text("SELECT id, excluded_markets, market_allocations FROM paper_trading_account")
+    ).fetchall()
+    for r in rows:
+        row_id = r[0]
+
+        # 已有非空比例则跳过，避免覆盖用户配置
+        raw_alloc = r[2]
+        has_alloc = False
+        if isinstance(raw_alloc, str) and raw_alloc.strip() and raw_alloc.strip() not in ("{}", "null"):
+            try:
+                has_alloc = bool(json.loads(raw_alloc))
+            except Exception:
+                has_alloc = False
+        elif isinstance(raw_alloc, dict):
+            has_alloc = bool(raw_alloc)
+        if has_alloc:
+            continue
+
+        excluded: list[str] = []
+        raw_excluded = r[1]
+        if isinstance(raw_excluded, str) and raw_excluded.strip():
+            try:
+                parsed = json.loads(raw_excluded)
+                if isinstance(parsed, list):
+                    excluded = [str(x) for x in parsed]
+            except Exception:
+                excluded = []
+        elif isinstance(raw_excluded, list):
+            excluded = [str(x) for x in raw_excluded]
+
+        alloc = allocations_from_excluded(excluded)
+        conn.execute(
+            text("UPDATE paper_trading_account SET market_allocations = :alloc WHERE id = :id"),
+            {"alloc": json.dumps(alloc, ensure_ascii=False), "id": row_id},
+        )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(101, "agent_config_kind_and_visibility", _m101_agent_config_kind),
     Migration(102, "backfill_agent_kind_data", _m102_backfill_agent_kind),
@@ -1551,6 +1603,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(115, "paper_trading_excluded_markets", _m115_paper_trading_excluded_markets),
     Migration(116, "chat_tables", _m116_chat_tables),
     Migration(117, "chat_initial_context", _m117_chat_initial_context),
+    Migration(118, "paper_trading_market_allocations", _m118_paper_trading_market_allocations),
 )
 
 

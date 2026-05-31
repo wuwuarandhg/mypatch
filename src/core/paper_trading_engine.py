@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.core.providers import ProviderRequest, get_quote_orchestrator
@@ -50,6 +51,86 @@ def _safe_float(v: Any) -> float | None:
         return float(v)
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# 分市场资金配置（投资比例 → 子池现金）
+# ---------------------------------------------------------------------------
+
+ALL_MARKETS: tuple[str, ...] = ("CN", "HK", "US")
+DEFAULT_ALLOCATIONS: dict[str, float] = {"CN": 0.5, "HK": 0.3, "US": 0.2}
+
+
+def normalize_allocations(raw: dict | None) -> dict[str, float]:
+    """补齐三市场、clamp 到 [0,1]，返回 {market: ratio}。"""
+    raw = raw or {}
+    out: dict[str, float] = {}
+    for m in ALL_MARKETS:
+        try:
+            v = float(raw.get(m, 0.0) or 0.0)
+        except Exception:
+            v = 0.0
+        out[m] = min(1.0, max(0.0, v))
+    return out
+
+
+def market_allocations_or_default(account: Any) -> dict[str, float]:
+    """账户未配置比例时回退默认配置，否则归一化已配置的比例。"""
+    raw = getattr(account, "market_allocations", None) or {}
+    if not raw:
+        return dict(DEFAULT_ALLOCATIONS)
+    return normalize_allocations(raw)
+
+
+def allocations_from_excluded(excluded: list[str] | None) -> dict[str, float]:
+    """迁移用：被排除市场比例置 0，其余市场按默认权重归一化到合计 1.0。"""
+    excluded_set = {str(m).upper() for m in (excluded or [])}
+    weights = {m: DEFAULT_ALLOCATIONS[m] for m in ALL_MARKETS if m not in excluded_set}
+    total = sum(weights.values())
+    if total <= 0:
+        # 全部被排除：兜底投 A 股
+        return {"CN": 1.0, "HK": 0.0, "US": 0.0}
+    return {m: round(weights.get(m, 0.0) / total, 6) for m in ALL_MARKETS}
+
+
+def compute_market_cash(
+    initial_capital: float, ratio: float, realized_pnl: float, open_cost: float
+) -> float:
+    """某市场可用现金 = 总资金×比例 + 该市场已实现盈亏 − 该市场持仓成本（纯函数，可单测）。"""
+    return initial_capital * ratio + realized_pnl - open_cost
+
+
+def market_realized_open(db: Session, market: str) -> tuple[float, float]:
+    """返回 (该市场已实现盈亏合计, 该市场未平仓持仓成本合计)。"""
+    realized = (
+        db.query(func.coalesce(func.sum(PaperTradingTrade.pnl), 0.0))
+        .filter(PaperTradingTrade.stock_market == market)
+        .scalar()
+    ) or 0.0
+    open_cost = (
+        db.query(
+            func.coalesce(
+                func.sum(PaperTradingPosition.entry_price * PaperTradingPosition.quantity),
+                0.0,
+            )
+        )
+        .filter(
+            PaperTradingPosition.status == "open",
+            PaperTradingPosition.stock_market == market,
+        )
+        .scalar()
+    ) or 0.0
+    return float(realized), float(open_cost)
+
+
+def market_available_cash(
+    db: Session, account: PaperTradingAccount, market: str, alloc: dict | None = None
+) -> float:
+    """某市场当前可用现金（用于建仓门槛与展示）。"""
+    alloc = alloc or market_allocations_or_default(account)
+    ratio = alloc.get(market, 0.0)
+    realized, open_cost = market_realized_open(db, market)
+    return compute_market_cash(account.initial_capital, ratio, realized, open_cost)
 
 
 def _serialize_position(pos: PaperTradingPosition) -> dict:
@@ -160,8 +241,9 @@ class PaperTradingEngine:
                 StrategySignalRun.entry_high.isnot(None),
             )
         )
-        # 排除用户不关注的市场
-        excluded = account.excluded_markets or []
+        # 按投资比例排除不投入（比例为 0）的市场
+        alloc = market_allocations_or_default(account)
+        excluded = [m for m in ALL_MARKETS if alloc.get(m, 0.0) <= 0]
         if excluded:
             query = query.filter(StrategySignalRun.stock_market.notin_(excluded))
         signals = query.order_by(StrategySignalRun.rank_score.desc()).limit(50).all()
@@ -199,6 +281,9 @@ class PaperTradingEngine:
         syms = [(s.stock_symbol, s.stock_market) for s in candidates]
         quotes = self._fetch_quotes_map(syms)
 
+        # 预算各市场可用现金（建仓时按市场子池逐笔扣减）
+        market_cash = {m: market_available_cash(db, account, m, alloc) for m in ALL_MARKETS}
+
         opened = 0
         for sig in candidates:
             key = (sig.stock_market, sig.stock_symbol)
@@ -212,8 +297,11 @@ class PaperTradingEngine:
             # 用当前市价入场
             entry_price = current_price
             cost = entry_price * FIXED_QUANTITY
-            if cost > account.current_capital:
-                continue
+            mkt = sig.stock_market
+            if alloc.get(mkt, 0.0) <= 0:
+                continue  # 该市场比例为 0，不投入
+            if cost > market_cash.get(mkt, 0.0):
+                continue  # 该市场子池额度不足
 
             # 基于入场价计算止损/止盈
             # 优先用信号的止损/止盈比例，否则用默认 -8%/+15%
@@ -252,6 +340,7 @@ class PaperTradingEngine:
             )
             db.add(pos)
             account.current_capital -= cost
+            market_cash[mkt] = market_cash.get(mkt, 0.0) - cost
             open_keys.add((sig.stock_symbol, sig.stock_market))
             new_keys.add((sig.stock_symbol, sig.stock_market))
             entry_events.append((pos, sig))

@@ -14,9 +14,16 @@ export interface PaperTradingAccountResponse {
   peak_capital: number
   enabled: boolean
   excluded_markets: string[]
+  /** 各市场投资比例 {CN/HK/US: 0~1} */
+  market_allocations: Record<string, number>
+  /** 仅按单市场口径返回时存在 */
+  market?: string
+  allocation_ratio?: number
   created_at: string
   updated_at: string
 }
+
+export type MarketView = 'ALL' | 'CN' | 'HK' | 'US'
 
 export interface PaperTradingPositionItem {
   id: number
@@ -108,19 +115,25 @@ export interface PaperTradingNotifySettings {
 }
 
 export const paperTradingApi = {
-  getAccount: () =>
-    fetchAPI<PaperTradingAccountResponse>('/paper-trading/account'),
-
-  listPositions: (status = 'open') =>
-    fetchAPI<PaperTradingPositionItem[]>(`/paper-trading/positions?status=${encodeURIComponent(status)}`),
-
-  listTrades: (limit = 50, offset = 0) =>
-    fetchAPI<PaperTradingTradesResponse>(
-      `/paper-trading/trades?limit=${encodeURIComponent(String(limit))}&offset=${encodeURIComponent(String(offset))}`
+  getAccount: (market?: string) =>
+    fetchAPI<PaperTradingAccountResponse>(
+      `/paper-trading/account${market && market !== 'ALL' ? `?market=${encodeURIComponent(market)}` : ''}`
     ),
 
-  getMetrics: () =>
-    fetchAPI<PaperTradingMetricsResponse>('/paper-trading/metrics'),
+  listPositions: (status = 'open', market?: string) =>
+    fetchAPI<PaperTradingPositionItem[]>(
+      `/paper-trading/positions?status=${encodeURIComponent(status)}${market && market !== 'ALL' ? `&market=${encodeURIComponent(market)}` : ''}`
+    ),
+
+  listTrades: (limit = 50, offset = 0, market?: string) =>
+    fetchAPI<PaperTradingTradesResponse>(
+      `/paper-trading/trades?limit=${encodeURIComponent(String(limit))}&offset=${encodeURIComponent(String(offset))}${market && market !== 'ALL' ? `&market=${encodeURIComponent(market)}` : ''}`
+    ),
+
+  getMetrics: (market?: string) =>
+    fetchAPI<PaperTradingMetricsResponse>(
+      `/paper-trading/metrics${market && market !== 'ALL' ? `?market=${encodeURIComponent(market)}` : ''}`
+    ),
 
   toggleAccount: (enabled: boolean) =>
     fetchAPI<PaperTradingAccountResponse>('/paper-trading/account/toggle', {
@@ -138,7 +151,11 @@ export const paperTradingApi = {
       method: 'POST',
     }),
 
-  updateSettings: (settings: { excluded_markets?: string[] }) =>
+  updateSettings: (settings: {
+    excluded_markets?: string[]
+    market_allocations?: Record<string, number>
+    initial_capital?: number
+  }) =>
     fetchAPI<PaperTradingAccountResponse>('/paper-trading/account/settings', {
       method: 'POST',
       body: JSON.stringify(settings),

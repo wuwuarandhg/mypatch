@@ -319,7 +319,10 @@ async def send_premarket_plan() -> None:
             if not account or not account.enabled:
                 return
 
-            excluded = account.excluded_markets or []
+            # 按投资比例排除不投入（比例为 0）的市场
+            from src.core.paper_trading_engine import ALL_MARKETS, market_allocations_or_default
+            alloc = market_allocations_or_default(account)
+            excluded = [m for m in ALL_MARKETS if alloc.get(m, 0.0) <= 0]
             query = (
                 db.query(StrategySignalRun)
                 .filter(

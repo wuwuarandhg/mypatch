@@ -936,7 +936,9 @@ class PaperTradingAccount(Base):
     max_drawdown_pct = Column(Float, nullable=False, default=0.0)
     peak_capital = Column(Float, nullable=False, default=1000000.0)
     enabled = Column(Boolean, default=True)
-    excluded_markets = Column(JSON, default=[])  # 排除的市场，如 ["US"]
+    excluded_markets = Column(JSON, default=[])  # 排除的市场，如 ["US"]（兼容旧字段，由 market_allocations 派生）
+    # 各市场投资比例 {"CN":0.5,"HK":0.3,"US":0.2}，比例 0~1、合计 ≤ 1；比例 0 表示不投入该市场
+    market_allocations = Column(JSON, default={})
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
