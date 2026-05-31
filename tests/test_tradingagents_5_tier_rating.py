@@ -12,6 +12,7 @@ from src.agents.tradingagents.result_mapper import (
     RATING_ACTION_MAP,
     RATING_LABEL_MAP,
     _parse_rating_from_text,
+    _parse_rating_label,
     map_state_to_result,
 )
 
@@ -121,27 +122,46 @@ def test_decision_unrecognized_then_text_has_underweight():
 # ============================================================
 # 正文与上游 decision 冲突:正文为准(生产 bug 回归)
 # 上游 propagate 二次提炼出 "HOLD",但 PM 正文白纸黑字写"卖出/买入",
-# 必须以正文为准,否则顶部显示"持有"但正文是"卖出"(数据不一致)。
+# 必须以正文为准。真实中文 PM 正文用全角标点(：),早期正则只认半角(:)
+# 导致"最终交易决策：Buy"匹配不到、仍回退到失真的 decision=HOLD 显示"持有"。
+# 这里全角/半角都覆盖。
 # ============================================================
 
-def test_text_sell_overrides_decision_hold():
-    """生产 bug:decision=Hold 但正文'最终交易决策:卖出/Sell' → 必须 sell(正文优先)"""
+def test_fullwidth_colon_buy_overrides_hold():
+    """生产 case(广汽 601238):decision=HOLD 但正文全角'最终交易决策： Buy' → 必须 buy"""
     text = (
-        "作为投资组合经理,我综合了风险分析师的辩论...\n\n"
-        "## 最终交易决策: **卖出**\n\n### 评级: **Sell**\n\n核心依据..."
+        "尊敬的各位投资决策者,经过对广汽集团(601238)的风险分析师辩论进行综合分析,"
+        "以下是我对最终交易决策的建议:\n\n"
+        "**最终交易决策： Buy**\n\n**决策依据：** 1. 盈利能力分析..."
     )
+    r = map_state_to_result(stock=_stock(), ta_result=_result("HOLD", final_decision_text=text))
+    assert r.raw_data["suggestion"]["action"] == "buy"
+    assert r.raw_data["suggestion"]["action_label"] == "买入"
+
+
+def test_fullwidth_colon_sell_overrides_hold():
+    """全角冒号 + 中文:decision=Hold 但正文'最终交易决策：卖出' → sell"""
+    text = "综合风险辩论...\n\n## 最终交易决策：**卖出**\n\n### 评级：**Sell**\n\n核心依据..."
     r = map_state_to_result(stock=_stock(), ta_result=_result("Hold", final_decision_text=text))
     assert r.raw_data["suggestion"]["action"] == "sell"
     assert r.raw_data["suggestion"]["action_label"] == "卖出"
     assert r.raw_data["suggestion"]["rating_raw"] == "sell"
 
 
-def test_text_buy_overrides_decision_hold():
-    """decision=Hold 但正文'评级:买入' → buy(正文优先)"""
-    text = "总之,广汽集团具备投资价值。\n\n最终交易决策: **买入**\n评级: 买入"
+def test_halfwidth_colon_still_works():
+    """半角冒号也要继续工作:'最终交易决策: 买入' → buy"""
+    text = "总之...\n\n最终交易决策: **买入**\n评级: 买入"
     r = map_state_to_result(stock=_stock(), ta_result=_result("Hold", final_decision_text=text))
     assert r.raw_data["suggestion"]["action"] == "buy"
-    assert r.raw_data["suggestion"]["action_label"] == "买入"
+
+
+def test_parse_rating_label_covers_both_colons():
+    """_parse_rating_label 全角(：)半角(:)冒号都能解析"""
+    assert _parse_rating_label("最终交易决策：Buy") == "buy"   # 全角
+    assert _parse_rating_label("最终交易决策: Buy") == "buy"   # 半角
+    assert _parse_rating_label("评级：卖出") == "sell"          # 全角中文
+    assert _parse_rating_label("评级: Sell") == "sell"         # 半角
+    assert _parse_rating_label("FINAL TRANSACTION PROPOSAL: **BUY**") == "buy"
 
 
 def test_decision_used_when_text_has_no_label():

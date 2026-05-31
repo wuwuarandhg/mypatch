@@ -114,9 +114,11 @@ def map_state_to_result(
 # ---- helpers ----
 
 
+# 分隔符字符类同时覆盖半角(: -)与全角(： －)标点 —— 真实中文 PM 正文用全角冒号"：",
+# 早期只认半角":"导致"最终交易决策：Buy"匹配不到、回退到上游失真的 decision。
 _RATING_TEXT_RE = re.compile(
     r"(?:Rating|评级|最终交易决策|Final\s+(?:Trade\s+)?Decision|FINAL\s+TRANSACTION\s+PROPOSAL)"
-    r"[\s\*:\-—]+(\*\*)?\s*(Buy|Overweight|Hold|Underweight|Sell|买入|增持|持有|减持|卖出)",
+    r"[\s\*:：\-—－]+(\*\*)?\s*(Buy|Overweight|Hold|Underweight|Sell|买入|增持|持有|减持|卖出)",
     re.I,
 )
 _RATING_ZH_TO_EN = {
