@@ -100,6 +100,10 @@ CHANNEL_TYPES = {
         "label": "PushPlus",
         "fields": ["token", "topic"],
     },
+    "pushme": {
+        "label": "PushMe",
+        "fields": ["push_key", "server_url", "group", "avatar", "msg_type"],
+    },
     "discord": {
         "label": "Discord",
         "fields": ["webhook_id", "webhook_token"],
@@ -114,10 +118,10 @@ CHANNEL_TYPES = {
 _APPRISE_TYPES = {"telegram", "bark", "dingtalk", "lark", "discord", "pushover"}
 
 # 自定义实现的渠道类型（带代理或特殊需求）
-_CUSTOM_IMPL_TYPES = {"wecom", "serverchan", "pushplus"}
+_CUSTOM_IMPL_TYPES = {"wecom", "serverchan", "pushplus", "pushme"}
 
 # 支持 Markdown 的渠道（不需要 sanitize）
-_MARKDOWN_CHANNELS = {"wecom", "serverchan", "pushplus", "dingtalk", "lark", "discord"}
+_MARKDOWN_CHANNELS = {"wecom", "serverchan", "pushplus", "pushme", "dingtalk", "lark", "discord"}
 
 # 不支持 Markdown 的渠道（需要 sanitize）
 _PLAIN_TEXT_CHANNELS = {"telegram", "bark", "pushover"}
@@ -358,6 +362,8 @@ class NotifierManager:
             await self._send_serverchan(config, title, content)
         elif ch_type == "pushplus":
             await self._send_pushplus(config, title, content)
+        elif ch_type == "pushme":
+            await self._send_pushme(config, title, content)
         else:
             logger.warning(f"未知的自定义渠道类型: {ch_type}")
 
@@ -486,3 +492,39 @@ class NotifierManager:
             if data.get("code") != 200:
                 raise RuntimeError(f"PushPlus 发送失败: {data.get('msg')}")
             logger.info(f"PushPlus 通知发送成功: {title}")
+
+    async def _send_pushme(self, config: dict, title: str, content: str):
+        """PushMe 推送（支持自建服务、消息分组、头像）"""
+        push_key = (config.get("push_key") or "").strip()
+        if not push_key:
+            raise ValueError("PushMe 需要 push_key")
+
+        server_url = (config.get("server_url") or "").strip().rstrip("/")
+        base_url = server_url if server_url else "https://push.i-i.me"
+        url = f"{base_url}/push"
+
+        # 构造带分组/头像的标题: [#分组!头像]title
+        group = (config.get("group") or "").strip()
+        avatar = (config.get("avatar") or "").strip()
+        final_title = title or "通知"
+        if group:
+            if avatar:
+                final_title = f"[#{group}!{avatar}]{final_title}"
+            else:
+                final_title = f"[#{group}]{final_title}"
+
+        msg_type = (config.get("msg_type") or "markdown").strip()
+
+        payload = {
+            "push_key": push_key,
+            "title": final_title,
+            "content": content,
+            "type": msg_type,
+        }
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, data=payload)
+            text = resp.text.strip()
+            if text != "success":
+                raise RuntimeError(f"PushMe 发送失败: {text[:200]}")
+            logger.info(f"PushMe 通知发送成功: {title}")

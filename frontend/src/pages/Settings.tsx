@@ -131,6 +131,16 @@ const CHANNEL_TYPE_FIELDS: Record<string, { label: string; fields: ChannelFieldD
       { key: 'app_token', label: 'App Token', placeholder: '应用 Token', secret: true, required: true },
     ],
   },
+  pushme: {
+    label: 'PushMe',
+    fields: [
+      { key: 'push_key', label: 'Push Key', placeholder: 'APP 上获取的 push_key', secret: true, required: true },
+      { key: 'server_url', label: '自建服务地址', placeholder: '选填，默认 https://push.i-i.me' },
+      { key: 'group', label: '消息分组', placeholder: '选填，如 PushMe' },
+      { key: 'avatar', label: '头像', placeholder: '选填，emoji/文字/图片URL，需配合分组' },
+      { key: 'msg_type', label: '消息类型', placeholder: '选填，默认 markdown' },
+    ],
+  },
 }
 
 const emptyServiceForm: ServiceForm = { name: '', base_url: '', api_key: '' }
