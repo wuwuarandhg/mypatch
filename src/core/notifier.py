@@ -501,7 +501,7 @@ class NotifierManager:
 
         server_url = (config.get("server_url") or "").strip().rstrip("/")
         base_url = server_url if server_url else "https://push.i-i.me"
-        url = f"{base_url}/push"
+        url = base_url
 
         # 构造带分组/头像的标题: [#分组!头像]title
         group = (config.get("group") or "").strip()
