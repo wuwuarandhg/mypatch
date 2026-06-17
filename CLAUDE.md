@@ -1,96 +1,142 @@
-# CLAUDE.md
+# CLAUDE.md — PanWatch (盯盘侠)
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+变更记录 (Changelog):
+- 2026-06-17: 全量扫描重构文档结构, 新增模块 CLAUDE.md + Mermaid 架构图
 
-## What is PanWatch
+---
 
-PanWatch (盯盘侠) is a self-hosted AI stock assistant with real-time market monitoring, technical analysis, multi-account portfolio management, and paper trading. It supports A-shares (CN), Hong Kong (HK), and US markets.
+## 项目愿景
 
-## Build & Run Commands
+自托管 AI 股票助手。实时行情监控、技术分析、多账户投资组合管理、模拟交易。支持 A 股、港股、美股。
 
-```bash
-# Backend
-python server.py                    # Start backend (port 8000, serves frontend static too)
-pip install -r requirements.txt     # Install Python deps
-make dev-api                        # 一键: venv + 依赖 + uvicorn --reload (port 8000)
+## 架构总览
 
-# Frontend
-cd frontend && pnpm install && pnpm dev      # Dev server (port 5183)
-make dev-web                                  # 一键: pnpm install + dev (port 5183)
-cd frontend && pnpm build                     # Production build (outputs to frontend/dist)
+```mermaid
+graph TD
+    ROOT["(根) PanWatch"] --> SRV["server.py"];
+    ROOT --> SRC["src"];
+    ROOT --> FE["frontend"];
+    ROOT --> T["tests"];
+    ROOT --> CFG["config/prompts/scripts"];
+    SRC --> WEB["src/web (FastAPI)"];
+    SRC --> AGENTS["src/agents"];
+    SRC --> CORE["src/core"];
+    SRC --> COLLECTORS["src/collectors"];
+    SRC --> MODELS["src/models"];
+    SRC --> CONFIG["src/config.py"];
 
-# Tests
-python -m pytest tests/ -v                    # Run all tests（默认不发通知）
-python -m pytest tests/ -v --notify           # Run all tests（实际发送通知）
-python -m pytest tests/test_paper_trading_notify.py -v  # Single test file
-
-# Git Hooks
-bash scripts/install-hooks.sh                # Install pre-push hook (runs tests before push)
-
-# Docker
-./build.sh <version>               # Build frontend + Docker image
+    click ROOT "./CLAUDE.md" "根文档"
+    click WEB "./src/web/CLAUDE.md" "Web/API 层"
+    click AGENTS "./src/agents/CLAUDE.md" "Agent 业务逻辑"
+    click CORE "./src/core/CLAUDE.md" "核心工具"
+    click FE "./frontend/CLAUDE.md" "React 前端"
+    click T "./tests/CLAUDE.md" "测试"
 ```
 
-## Architecture
+## 模块索引
 
-### Backend (Python / FastAPI)
+| 模块路径 | 职责 | 语言 | 入口 | 测试 |
+|---|---|---|---|---|
+| `src/web/` | FastAPI REST API, SQLAlchemy ORM, JWT 认证 | Python | `app.py` | 通过 API 路由覆盖 |
+| `src/agents/` | 6 个 Agent 实现 (盘前/盘中/复盘/新闻/技术/深度分析) | Python | `base.py` | `tests/test_intraday_monitor*.py` |
+| `src/core/` | AI 客户端、通知、调度、模拟盘引擎、策略引擎、数据源编排 | Python | (库模块) | `tests/test_notify_policy.py`, `tests/test_json_safe.py` |
+| `src/core/providers/` | 行情/K线/资金流/事件 多数据源主备调度 | Python | `orchestrator.py` | `tests/test_quote_orchestrator.py`, `tests/test_kline_orchestrator.py` |
+| `src/core/signals/` | 策略信号生成包 (SignalPack) | Python | `signal_pack.py` | — |
+| `src/collectors/` | 无状态数据采集器 (akshare, efinance 等) | Python | (库模块) | — |
+| `src/models/` | 市场定义 (MarketCode, TradingSession) | Python | `market.py` | — |
+| `frontend/` | React + TypeScript + Vite, shadcn/ui, pnpm workspaces | TS/TSX | `main.tsx` → `App.tsx` | — |
+| `frontend/packages/api/` | 前端 API 客户端 + TypeScript 类型定义 | TS | `index.ts` | — |
+| `frontend/packages/base-ui/` | shadcn/ui 基础组件库 | TSX | `index.ts` | — |
+| `frontend/packages/biz-ui/` | 业务组件 (K线图, 深度分析弹窗等) | TS/TSX | `index.ts` | — |
+| `tests/` | 23 个 pytest 单测文件 | Python | `conftest.py` | — |
 
-- **`server.py`** — Entrypoint. Initializes DB, registers agents/data sources, starts schedulers (APScheduler), mounts FastAPI app.
-- **`src/config.py`** — `Settings` (pydantic-settings, from `.env`), `AppConfig`, `StockConfig` (from YAML).
-- **`src/web/`** — FastAPI app with JWT auth (`HTTPBearer`). API routes in `src/web/api/`. Models in `src/web/models.py`. SQLite DB via SQLAlchemy (`src/web/database.py`).
-- **`src/agents/`** — Business logic agents (premarket_outlook, daily_report, intraday_monitor, news_digest, chart_analyst). Each registered in `server.py` `AGENT_REGISTRY`.
-- **`src/collectors/`** — Stateless data collectors (quotes, kline, news). Use `efinance`/`akshare` for CN market data.
-- **`src/core/`** — Core utilities:
-  - `ai_client.py` — OpenAI-compatible API client
-  - `notifier.py` / `notify_dedupe.py` / `notify_policy.py` — Notification system (Telegram, WeChat Work, DingTalk, Bark, Webhook via Apprise)
-  - `scheduler.py` — Agent scheduling
-  - `paper_trading_engine.py` / `paper_trading_notifier.py` / `paper_trading_scheduler.py` — Paper trading system
-  - `signals/` — Strategy signal generation (trend_follow, macd_golden, momentum, etc.)
-  - `stock_link.py` — Shared utility for generating stock URLs (global `stock_link_platform` setting)
-- **`prompts/`** — Prompt templates used by agents (one file per agent).
-- **`src/web/models.py`** — All SQLAlchemy ORM models (Stock, AgentConfig, PaperTradingPosition, PaperTradingTrade, StrategySignalRun, NotifyChannel, AppSettings, etc.)
+## 运行与开发
 
-### Frontend (React + TypeScript + Vite)
+```bash
+# 后端
+python server.py                        # 启动 (port 8000)
+make dev-api                            # 一键: venv + 依赖 + uvicorn --reload
 
-- **Monorepo** with pnpm workspaces under `frontend/packages/`:
-  - `packages/api/` — API client functions and TypeScript interfaces
-  - `packages/base-ui/` — shadcn/ui component library (Radix UI + Tailwind)
-  - `packages/biz-ui/` — Business components
-- **Pages** in `frontend/src/pages/` — Dashboard, PaperTrading, Settings, etc.
-- **Styling** — Tailwind CSS with shadcn/ui components
+# 前端
+cd frontend && pnpm install && pnpm dev  # Dev (port 5183)
+cd frontend && pnpm build                # 构建输出到 frontend/dist
+make dev-web                             # 一键: pnpm install + dev
 
-### API Response Format
+# 测试
+python -m pytest tests/ -v               # 全部单测 (默认不发通知)
+python -m pytest tests/ -v --notify      # 发真实通知
+python -m pytest tests/test_paper_trading_notify.py -v  # 单个文件
 
-All API responses are wrapped: `{ code: number, data: T, message: string }`. Frontend `fetchAPI` unwraps this automatically.
+# Git Hooks
+bash scripts/install-hooks.sh           # 安装 pre-push hook
 
-### Key Patterns
+# Docker
+./build.sh <version>                    # 构建前端 + Docker 镜像
+```
 
-- **ORM serialization before session close**: In `paper_trading_engine.py`, ORM objects are serialized to plain dicts via `_serialize_position()` / `_serialize_trade()` / `_serialize_signal()` before `db.close()`, to avoid detached instance errors in async notification code.
-- **Global settings**: Stored in `AppSettings` table (key-value). Accessed via DB query. Settings API at `/api/settings`.
-- **Notification channels**: Configured in UI, stored in `NotifyChannel` table. Support multiple channel types via Apprise URIs.
-- **Strategy signals**: Generated by `src/core/signals/`, stored as `StrategySignalRun`. Paper trading engine consumes these to open/close positions.
+## 测试策略
 
-## Coding Conventions
+- 默认屏蔽通知发送 (`conftest.py` monkeypatch NotifierManager)
+- `--notify` 参数恢复真实发送 (集成测试用)
+- 测试函数必须写中文 docstring 首行, `pytest_itemcollected` hook 自动显示为中文节点名
+- 配置: `pyproject.toml` 定义 testpaths
+- CI: `.github/workflows/release.yml` docker build 前跑测试, 失败中断
 
-- Python: PEP 8, type hints for new code, `snake_case` files/functions, `PascalCase` classes
-- TypeScript: `PascalCase.tsx` components, `use-` prefix hooks, `camelCase.ts` utilities
-- Commits: `<type>: <subject>` where type ∈ {feat, fix, docs, refactor, style, test, chore}
-- All user-facing text is in Chinese (zh-CN)
-- Strategy names have a Chinese mapping in `STRATEGY_NAME_MAP` (paper_trading_notifier.py)
+## 编码规范
 
-## Testing
+- Python: PEP 8, 类型注解, `snake_case` 文件/函数, `PascalCase` 类
+- TypeScript: `PascalCase.tsx` 组件, `use-` 前缀 hooks, `camelCase.ts` 工具
+- 提交: `<type>: <subject>`, type ∈ {feat, fix, docs, refactor, style, test, chore}
+- 用户界面文本一律中文
+- 策略名称在 `paper_trading_notifier.py` 的 `STRATEGY_NAME_MAP` 有中文映射
 
-- **配置**: `pyproject.toml` 定义 pytest 配置，`tests/conftest.py` 提供共用 fixtures
-- **通知屏蔽**: 默认单测不发通知（monkeypatch NotifierManager），传 `--notify` 恢复真实发送
-- **pre-push hook**: `scripts/pre-push` 在 push 前自动跑测试，通过 `bash scripts/install-hooks.sh` 安装
-- **CI**: `.github/workflows/release.yml` 在 Docker build 前运行测试，失败则中断发布
-- **中文描述**: 每个测试函数必须写中文 docstring（第一行），pytest -v 输出时会自动显示为中文说明（通过 `conftest.py` 中的 `pytest_itemcollected` hook 实现）
+## AI 使用指引
 
-## Environment Variables
+- 新 Agent: 继承 `BaseAgent` (src/agents/base.py), 实现 `collect()` + `build_prompt()`, 注册到 `server.py`
+- 新数据源: 在 `src/core/providers/` 下按类型子目录添加 provider 实现, 注册到 `server.py` 的 `seed_providers()`
+- API 路由: 加文件到 `src/web/api/`, 在 `src/web/app.py` 注册 router
+- 前端新页面: 加文件到 `frontend/src/pages/`, 在 `App.tsx` 注册 `<Route>`
+- API 响应自动被 `ResponseWrapperMiddleware` 包装为 `{code, success, data, message}` 格式
+- TradingAgents 是软依赖 (`tradingagents@git+...`), 未安装时返回明确错误
 
-Key env vars (configured via `.env` or UI settings):
-- `AUTH_USERNAME` / `AUTH_PASSWORD` — Login credentials
-- `JWT_SECRET` — JWT signing key
-- `DATA_DIR` — Runtime data directory (default: `./data`)
-- `AI_API_KEY` / `AI_BASE_URL` / `AI_MODEL` — AI service config
-- `HTTP_PROXY` — Proxy for external requests
+## 数据流
+
+```
+┌─────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Timed Job   │───>│  Agent       │───>│  AI Client   │
+│ (APScheduler)│    │ (BaseAgent)  │    │ (OpenAI-compat)│
+└─────────────┘    └──────┬───────┘    └──────────────┘
+                          │
+                    ┌─────▼──────┐
+                    │  SignalPack │
+                    │ (结构化输入) │
+                    └─────┬──────┘
+                          │
+              ┌───────────┼───────────┐
+              ▼           ▼           ▼
+       ┌──────────┐ ┌──────────┐ ┌──────────┐
+       │ Providers │ │Collectors│ │ Position │
+       │(主备调度) │ │ (akshare)│ │ (DB)     │
+       └──────────┘ └──────────┘ └──────────┘
+```
+
+## 覆盖率报告
+
+扫描时间: 2026-06-17 23:29 +0800
+估算总文件数: ~200+
+已扫描核心文件: 60+
+覆盖范围: 全模块识别完成, 所有关键入口/模型/API/Agent 已扫描
+
+### 扫描缺口
+
+- `src/web/api/` 有 21 个路由文件, 未逐文件读取细节 (可通过 API 路由名推断职责)
+- `src/core/providers/` 各 provider 实现细节未遍历
+- `frontend/src/pages/` 各页面实现细节未遍历 (可通过路由名推断)
+- `src/core/signals/structured_output.py` 等工具模块未读
+
+### 下一步推荐扫描
+
+1. `src/web/api/` — 逐路由确认端点签名 (需要时)
+2. `src/core/providers/` 各 provider 实现 (数据源调优时)
+3. `frontend/src/pages/` 页面实现 (UI 修改时)
+4. `src/web/migrations.py` — 版本化迁移逻辑
